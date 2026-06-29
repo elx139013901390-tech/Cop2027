@@ -1,176 +1,177 @@
 import logging
 import sqlite3
 import asyncio
+import random
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# --- تنظیمات حیاتی ---
-TOKEN = "YOUR_BOT_TOKEN_HERE"  # توکن خود را اینجا بگذارید
-CREATOR_NAME = "امیرعلی فروزان اصل"
+# --- تنظیمات اصلی (حتماً تغییر دهید) ---
+TOKEN = 'YOUR_BOT_TOKEN_HERE'
+OWNER_ID = 12345678  # آیدی عددی تلگرام خودتان
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-# --- مدیریت دیتابیس (هسته اطلاعات) ---
+# --- سیستم دیتابیس قدرتمند (SQLite) ---
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect('bot_pro.db', check_same_thread=False)
+        self.conn = sqlite3.connect('bot_engine.db', check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.create_tables()
 
     def create_tables(self):
-        # جدول مالک اصلی
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS owner (user_id INTEGER PRIMARY KEY, is_owner INTEGER)")
-        # جدول کاربران (اقتصادی)
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, coins INTEGER DEFAULT 100, exp INTEGER DEFAULT 0)")
-        # جدول گروه‌ها و قفل‌ها
-        self.cursor.execute("""CREATE TABLE IF NOT EXISTS groups (
-            chat_id INTEGER PRIMARY KEY, 
-            group_name TEXT,
-            lock_link INTEGER DEFAULT 0,
-            lock_media INTEGER DEFAULT 0,
-            lock_sticker INTEGER DEFAULT 0,
-            lock_gif INTEGER DEFAULT 0,
-            lock_file INTEGER DEFAULT 0,
-            welcome_msg TEXT DEFAULT 'سلام به عضو جدید!'
-        )""")
+        # جدول تنظیمات گروه‌ها (تمام قفل‌ها)
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS groups 
+            (chat_id INTEGER PRIMARY KEY, lock_link INT=0, lock_gif INT=0, lock_photo INT=0, 
+             lock_video INT=0, lock_voice INT=0, lock_file INT=0, lock_sticker INT=0, 
+             lock_forward INT=0, lock_bot INT=0, welcome_msg TEXT)''')
+        
+        # جدول اقتصاد و کاربران
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS users 
+            (user_id INTEGER PRIMARY KEY, coins INT=0, xp INT=0, level INT=1, 
+             is_banned INT=0, is_muted INT=0, role TEXT='user')''')
+        
+        # جدول ادمین‌ها
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)''')
         self.conn.commit()
 
-    def set_owner(self, user_id):
-        self.cursor.execute("INSERT OR IGNORE INTO owner (user_id, is_owner) VALUES (?, 1)", (user_id,))
-        self.conn.commit()
-
-    def get_owner(self):
-        self.cursor.execute("SELECT user_id FROM owner WHERE is_owner = 1")
-        res = self.cursor.fetchone()
-        return res[0] if res else None
-
-    def add_group(self, chat_id, name):
-        self.cursor.execute("INSERT OR IGNORE INTO groups (chat_id, group_name) VALUES (?, ?)", (chat_id, name))
-        self.conn.commit()
-
-    def get_group_settings(self, chat_id):
+    def get_group(self, chat_id):
         self.cursor.execute("SELECT * FROM groups WHERE chat_id = ?", (chat_id,))
         return self.cursor.fetchone()
 
+    def update_group_setting(self, chat_id, column, value):
+        self.cursor.execute(f"INSERT OR IGNORE INTO groups (chat_id) VALUES (?)", (chat_id,))
+        self.cursor.execute(f"UPDATE groups SET {column} = ? WHERE chat_id = ?", (value, chat_id))
+        self.conn.commit()
+
+    def get_user(self, user_id):
+        self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        return self.cursor.fetchone()
+
+    def add_user(self, user_id):
+        self.cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        self.conn.commit()
+
 db = Database()
 
-# --- توابع امنیتی ---
-async def is_real_owner(update: Update):
-    owner_id = db.get_owner()
-    return update.effective_user.id == owner_id
+# --- بخش مدیریت و قفل‌ها (Security Core) ---
 
-# --- دستورات اصلی ---
+async def main_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type == 'private':
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    msg = update.effective_message
+
+    # چک کردن بن بودن کاربر
+    user = db.get_user(user_id)
+    if user and user[4] == 1: return
+
+    # دریافت تنظیمات گروه
+    group = db.get_group(chat_id)
+    if not group:
+        db.cursor.execute("INSERT INTO groups (chat_id) VALUES (?)", (chat_id,))
+        db.conn.commit()
+        return
+
+    # منطق قفل‌ها (Locking System)
+    # group[1]=link, group[2]=gif, group[3]=photo, group[4]=video, group[5]=voice, group[6]=file, group[7]=sticker, group[8]=forward
+    
+    if group[1] == 1 and (msg.entities or msg.caption) and any(e.type in ['url', 'text_link'] for e in (msg.entities or [])):
+        await msg.delete()
+        return
+
+    if group[2] == 1 and msg.animation:
+        await msg.delete()
+        return
+
+    if group[3] == 1 and msg.photo:
+        await msg.delete()
+        return
+
+    if group[4] == 1 and msg.video:
+        await msg.delete()
+        return
+
+# --- بخش اقتصاد و بازی (Economy & Fun) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
-    # تشخیص مالکیت مطلق
-    if db.get_owner() is None:
-        db.set_owner(user_id)
-        msg = f"👑 **شما مالک اصلی ربات شدید!**\n\n🛠 ساخته شده توسط: {CREATOR_NAME}\n\nاز این لحظه تمام پنل‌های مدیریت در اختیار شماست."
-    else:
-        # ثبت کاربر عادی
-        db.cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        db.conn.commit()
-        msg = f"سلام {update.effective_user.first_name} عزیز! به ربات مدیریت و بازی خوش آمدی. 🚀"
+    db.add_user(user_id)
+    await update.message.reply_text(
+        f"🤖 **سلام {update.effective_user.first_name}!**\n\n"
+        f"🚀 به ربات مدیریت پیشرفته خوش آمدی.\n"
+        f"🛠 سازنده: **امیرعلی فروزان اصل**\n\n"
+        f"💰 سکه: 0 | 🆙 لول: 1\n"
+        f"📜 از دستور /help برای مشاهده امکانات استفاده کنید."
+    )
 
-    await update.message.reply_text(msg, parse_mode='Markdown')
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    if user:
+        text = (f"👤 **پروفایل کاربر**\n\n"
+                f"🆔 آیدی: `{user[0]}`\n"
+                f"💰 سکه: {user[1]}\n"
+                f"✨ XP: {user[2]}\n"
+                f"🆙 لول: {user[3]}")
+        await update.message.reply_text(text, parse_mode='Markdown')
+
+async def coin_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # بازی شیر یا خط (Fun Section)
+    res = random.choice(["شیر 🪙", "خط ❌"])
+    user_id = update.effective_user.id
+    db.cursor.execute("UPDATE users SET coins = coins + 10 WHERE user_id = ?", (user_id,))
+    db.conn.commit()
+    await update.message.reply_text(f"نتیجه: {res}\n\n🎉 شما 10 سکه برنده شدید!")
+
+# --- پنل مدیریت (Admin Panel) ---
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پنل مدیریت اصلی که فقط برای مالک باز می‌شود"""
-    if not await is_real_owner(update):
-        await update.message.reply_text("❌ دسترسی غیرمجاز! این پنل فقط برای مالک اصلی است.")
-        return
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("❌ فقط مالک ربات می‌تواند این دستور را اجرا کند.")
 
     keyboard = [
-        [InlineKeyboardButton("📊 آمار کل ربات", callback_data='admin_stats'), InlineKeyboardButton("👥 کاربران", callback_data='admin_users')],
-        [InlineKeyboardButton("🛡 تنظیمات گروه‌ها", callback_data='admin_groups'), InlineKeyboardButton("💰 مدیریت سکه", callback_data='admin_coins')],
-        [InlineKeyboardButton("📢 پیام همگانی", callback_data='admin_broadcast'), InlineKeyboardButton("🎁 کد هدیه", callback_data='admin_gift')],
-        [InlineKeyboardButton("🛠 راهنما", callback_data='help_admin')]
+        [InlineKeyboardButton("🔒 قفل لینک", callback_data="lock_link"), InlineKeyboardButton("🔓 باز کردن لینک", callback_data="unlock_link")],
+        [InlineKeyboardButton("🎬 قفل فیلم", callback_data="lock_video"), InlineKeyboardButton("🔓 باز کردن فیلم", callback_data="unlock_video")],
+        [InlineKeyboardButton("📊 آمار کاربران", callback_data="stats")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"👑 **پنل مدیریت فوق حرفه‌ای**\n👤 مالک: {CREATOR_NAME}\n\nلطفاً یک گزینه را انتخاب کنید:", reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text("🛠 **پنل مدیریت اصلی**\nانتخاب کنید چه چیزی را مدیریت کنید:", reply_markup=reply_markup)
 
-async def group_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور برای گرفتن آمار گروه"""
-    chat = update.effective_chat
-    if chat.type == "private":
-        await update.message.reply_text("❌ این دستور فقط در گروه‌ها کار می‌کند.")
-        return
-    
-    db.add_group(chat.id, chat.title)
-    settings = db.get_group_settings(chat.id)
-    
-    text = (f"📊 **آمار گروه:**\n\n"
-            f"📝 نام: {chat.title}\n"
-            f"🆔 شناسه: `{chat.id}`\n"
-            f"🛡 وضعیت قفل‌ها: {'فعال' if settings[1] else 'غیرفعال'}")
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-# --- مدیریت محتوا (قفل‌ها) ---
-
-async def security_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    
-    # اگر در گروه نبودیم یا کاربر ادمین بود، کاری نکن
-    if update.effective_chat.type == "private": return
-    
-    member = await context.bot.get_chat_member(chat_id, user_id)
-    if member.status in ['administrator', 'creator']: return
-
-    # بررسی تنظیمات گروه از دیتابیس
-    settings = db.get_group_settings(chat_id)
-    if not settings: return
-
-    # فرض: settings[1]=lock_link, settings[2]=lock_media...
-    
-    # ۱. قفل لینک
-    if update.message.entities:
-        for entity in update.message.entities:
-            if entity.type in ["url", "text_link"]:
-                if settings[1] == 1:
-                    await update.message.delete()
-                    await context.bot.send_message(chat_id, f"🚫 {update.effective_user.first_name}، ارسال لینک ممنوع است!")
-                    return
-
-    # ۲. قفل مدیا (عکس، ویدیو، فایل و ...)
-    if settings[2] == 1: # قفل کلی مدیا
-        if update.message.photo or update.message.video or update.message.document or update.message.sticker:
-            await update.message.delete()
-            await context.bot.send_message(chat_id, f"🚫 {update.effective_user.first_name}، ارسال فایل/عکس ممنوع است!")
-            return
-
-# --- مدیریت دکمه‌ها (Callback) ---
-
-async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    chat_id = update.effective_chat.id
     await query.answer()
-    
-    if query.data == 'admin_stats':
-        # اینجا کد گرفتن آمار از دیتابیس قرار می‌گیرد
-        await query.edit_message_text("📈 آمار در حال بارگذاری... (بخش در حال توسعه)")
-    
-    elif query.data == 'back_to_admin':
-        # بازگشت به منوی اصلی
-        pass # مشابه کد پنل اصلی
 
-# --- اجرای ربات ---
+    if query.data == "lock_link":
+        db.update_group_setting(chat_id, "lock_link", 1)
+        await query.edit_message_text("✅ قفل لینک فعال شد.")
+    elif query.data == "unlock_link":
+        db.update_group_setting(chat_id, "lock_link", 0)
+        await query.edit_message_text("🔓 قفل لینک غیرفعال شد.")
+    elif query.data == "lock_video":
+        db.update_group_setting(chat_id, "lock_video", 1)
+        await query.edit_message_text("✅ قفل فیلم فعال شد.")
+    elif query.data == "unlock_video":
+        db.update_group_setting(chat_id, "lock_video", 0)
+        await query.edit_message_text("🔓 قفل فیلم غیرفعال شد.")
 
-def main():
-    app = Application.builder().token(TOKEN).build()
+# --- اجرا ---
+
+if __name__ == '__main__':
+    app = ApplicationBuilder().token(TOKEN).build()
 
     # هندلرها
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("coin", coin_game))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("آمار_گروه", group_info))
-    app.add_handler(CallbackQueryHandler(handle_callbacks))
+    app.add_handler(CommandHandler("help", lambda u, c: u.message.reply_text("دستورات:\n/start - شروع\n/profile - پروفایل\n/coin - بازی سکه\n/admin - پنل مدیریت")))
     
-    # فیلتر امنیتی (بسیار مهم)
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, security_filter))
+    # هندلر دکمه‌ها
+    app.add_handler(CallbackQueryHandler(button_callback))
 
-    print("🚀 سیستم حرفه‌ای فعال شد...")
+    # هندلر اصلی فیلتر (Security Engine)
+    app.add_handler(MessageHandler(filters.ALL, main_filter))
+
+    print("🚀 ربات با موفقیت توسط امیرعلی فروزان اصل روشن شد...")
     app.run_polling()
-
-if __name__ == '__main__':
-    main()
