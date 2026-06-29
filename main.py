@@ -25,9 +25,21 @@ class Database:
              lock_forward INT=0, lock_bot INT=0, welcome_msg TEXT)''')
         
         # جدول اقتصاد و کاربران
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-            (user_id INTEGER PRIMARY KEY, coins INT=0, xp INT=0, level INT=1, 
-             is_banned INT=0, is_muted INT=0, role TEXT='user')''')
+        self.cursor.execute("""
+CREATE TABLE IF NOT EXISTS groups (
+    chat_id INTEGER PRIMARY KEY,
+    lock_link INTEGER DEFAULT 0,
+    lock_gif INTEGER DEFAULT 0,
+    lock_photo INTEGER DEFAULT 0,
+    lock_video INTEGER DEFAULT 0,
+    lock_voice INTEGER DEFAULT 0,
+    lock_file INTEGER DEFAULT 0,
+    lock_sticker INTEGER DEFAULT 0,
+    lock_forward INTEGER DEFAULT 0,
+    lock_bot INTEGER DEFAULT 0,
+    welcome_msg TEXT DEFAULT 'سلام'
+)
+""")
         
         # جدول ادمین‌ها
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)''')
