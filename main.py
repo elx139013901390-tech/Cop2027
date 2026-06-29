@@ -186,16 +186,22 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- دستورات اقتصاد و سرگرمی ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db.add_user(user_id)
-    await update.message.reply_text(
-        f"👋 سلام {update.effective_user.first_name} عزیز!\n"
-        f"🤖 ربات مدیریت پیشرفته آماده است.\n"
-        f"🛠 سازنده: **امیرعلی فروزان اصل**\n\n"
-        f"💰 سکه: 0 | 🆙 لول: 1\n"
-        f"📜 دستورات: /profile, /coin, /help",
-        parse_mode='Markdown'
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+
+    if not user:
+        db.add_user(update.effective_user.id)
+        user = db.get_user(update.effective_user.id)
+
+    text = (
+        f"👤 پروفایل\n\n"
+        f"🆔 آیدی: {user[0]}\n"
+        f"💰 سکه: {user[1]}\n"
+        f"⭐ XP: {user[2]}\n"
+        f"🏆 لول: {user[3]}"
     )
+
+    await update.message.reply_text(text)
+    
 
 async def profile(update: Update, context: Context
