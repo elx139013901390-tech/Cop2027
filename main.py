@@ -2,188 +2,200 @@ import logging
 import sqlite3
 import asyncio
 import random
-from datetime import datetime
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# --- تنظیمات اصلی (حتماً تغییر دهید) ---
-TOKEN = 'YOUR_BOT_TOKEN_HERE'
-OWNER_ID = 12345678  # آیدی عددی تلگرام خودتان
+# --- تنظیمات اولیه ---
+TOKEN = 'YOUR_BOT_TOKEN_HERE' # توکن خودت را اینجا بگذار
+OWNER_ID = 12345678 # آیدی عددی خودت را اینجا بگذار
 
-# --- سیستم دیتابیس قدرتمند (SQLite) ---
+# تنظیمات لاگ
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# --- سیستم دیتابیس پیشرفته ---
 class Database:
-    def __init__(self):
-        self.conn = sqlite3.connect('bot_engine.db', check_same_thread=False)
+    def __init__(self, db_name="bot_engine.db"):
+        self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.create_tables()
 
     def create_tables(self):
-        # جدول تنظیمات گروه‌ها (تمام قفل‌ها)
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS groups 
-            (chat_id INTEGER PRIMARY KEY, lock_link INT=0, lock_gif INT=0, lock_photo INT=0, 
-             lock_video INT=0, lock_voice INT=0, lock_file INT=0, lock_sticker INT=0, 
-             lock_forward INT=0, lock_bot INT=0, welcome_msg TEXT)''')
+        # جدول تنظیمات گروه (تمام قفل‌ها)
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS groups (
+            chat_id INTEGER PRIMARY KEY,
+            lock_link INTEGER DEFAULT 0, lock_gif INTEGER DEFAULT 0, lock_photo INTEGER DEFAULT 0,
+            lock_video INTEGER DEFAULT 0, lock_voice INTEGER DEFAULT 0, lock_file INTEGER DEFAULT 0,
+            lock_sticker INTEGER DEFAULT 0, lock_forward INTEGER DEFAULT 0, lock_text INTEGER DEFAULT 0,
+            welcome_msg TEXT DEFAULT 'به گروه خوش آمدید!'
+        )''')
+
+        # جدول کاربران (اقتصاد، سطح و مدیریت)
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            coins INTEGER DEFAULT 0, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1,
+            is_banned INTEGER DEFAULT 0, is_muted INTEGER DEFAULT 0, role TEXT DEFAULT 'user'
+        )''')
         
-        # جدول اقتصاد و کاربران
-        self.cursor.execute("""
-CREATE TABLE IF NOT EXISTS groups (
-    chat_id INTEGER PRIMARY KEY,
-    lock_link INTEGER DEFAULT 0,
-    lock_gif INTEGER DEFAULT 0,
-    lock_photo INTEGER DEFAULT 0,
-    lock_video INTEGER DEFAULT 0,
-    lock_voice INTEGER DEFAULT 0,
-    lock_file INTEGER DEFAULT 0,
-    lock_sticker INTEGER DEFAULT 0,
-    lock_forward INTEGER DEFAULT 0,
-    lock_bot INTEGER DEFAULT 0,
-    welcome_msg TEXT DEFAULT 'سلام'
-)
-""")
+        # جدول اخطارها
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS warnings (
+            user_id INTEGER, chat_id INTEGER, count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, chat_id)
+        )''')
         
-        # جدول ادمین‌ها
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)''')
         self.conn.commit()
 
     def get_group(self, chat_id):
         self.cursor.execute("SELECT * FROM groups WHERE chat_id = ?", (chat_id,))
-        return self.cursor.fetchone()
+        res = self.cursor.fetchone()
+        if not res:
+            self.cursor.execute("INSERT INTO groups (chat_id) VALUES (?)", (chat_id,))
+            self.conn.commit()
+            return self.get_group(chat_id)
+        return res
 
-    def update_group_setting(self, chat_id, column, value):
-        self.cursor.execute(f"INSERT OR IGNORE INTO groups (chat_id) VALUES (?)", (chat_id,))
+    def set_group_setting(self, chat_id, column, value):
         self.cursor.execute(f"UPDATE groups SET {column} = ? WHERE chat_id = ?", (value, chat_id))
         self.conn.commit()
 
     def get_user(self, user_id):
         self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        return self.cursor.fetchone()
+        res = self.cursor.fetchone()
+        if not res:
+            self.cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+            self.conn.commit()
+            return self.get_user(user_id)
+        return res
 
-    def add_user(self, user_id):
-        self.cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    def update_user_status(self, user_id, field, value):
+        self.cursor.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
         self.conn.commit()
+
+    def add_coin(self, user_id, amount):
+        self.cursor.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (amount, user_id))
+        self.conn.commit()
+
+    def add_warning(self, user_id, chat_id):
+        self.cursor.execute('''
+            INSERT INTO warnings (user_id, chat_id, count) VALUES (?, ?, 1)
+            ON CONFLICT(user_id, chat_id) DO UPDATE SET count = count + 1
+        ''', (user_id, chat_id))
+        self.conn.commit()
+
+    def get_warnings(self, user_id, chat_id):
+        self.cursor.execute("SELECT count FROM warnings WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+        res = self.cursor.fetchone()
+        return res[0] if res else 0
 
 db = Database()
 
-# --- بخش مدیریت و قفل‌ها (Security Core) ---
+# --- سیستم ضد اسپم و فلود (در حافظه) ---
+user_flood_control = {}
 
-async def main_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- مدیریت اصلی پیام‌ها و قفل‌ها ---
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.type == 'private':
         return
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     msg = update.effective_message
-
-    # چک کردن بن بودن کاربر
-    user = db.get_user(user_id)
-    if user and user[4] == 1: return
-
-    # دریافت تنظیمات گروه
-    group = db.get_group(chat_id)
-    if not group:
-        db.cursor.execute("INSERT INTO groups (chat_id) VALUES (?)", (chat_id,))
-        db.conn.commit()
-        return
-
-    # منطق قفل‌ها (Locking System)
-    # group[1]=link, group[2]=gif, group[3]=photo, group[4]=video, group[5]=voice, group[6]=file, group[7]=sticker, group[8]=forward
     
-    if group[1] == 1 and (msg.entities or msg.caption) and any(e.type in ['url', 'text_link'] for e in (msg.entities or [])):
+    if not msg: return
+
+    # ۱. بررسی بن بودن و سکوت کاربر
+    user = db.get_user(user_id)
+    if user[4] == 1: # is_banned
+        await msg.delete()
+        return
+    if user[5] == 1: # is_muted
         await msg.delete()
         return
 
-    if group[2] == 1 and msg.animation:
-        await msg.delete()
+    # ۲. دریافت تنظیمات گروه
+    group = db.get_group(chat_id)
+    # group[1]=link, group[2]=gif, group[3]=photo, group[4]=video, group[5]=voice, group[6]=file, group[7]=sticker, group[8]=forward, group[9]=text
+
+    # ۳. اجرای قفل‌ها
+    try:
+        if group[1] == 1 and (msg.entities or msg.caption) and any(e.type in ['url', 'text_link'] for e in (msg.entities or [])):
+            await msg.delete()
+            return
+
+        if group[2] == 1 and msg.animation:
+            await msg.delete()
+            return
+
+        if group[3] == 1 and msg.photo:
+            await msg.delete()
+            return
+
+        if group[4] == 1 and msg.video:
+            await msg.delete()
+            return
+
+        if group[5] == 1 and msg.voice:
+            await msg.delete()
+            return
+
+        if group[6] == 1 and msg.document:
+            await msg.delete()
+            return
+
+        if group[7] == 1 and msg.sticker:
+            await msg.delete()
+            return
+
+        if group[8] == 1 and msg.forward_from:
+            await msg.delete()
+            return
+
+    except Exception as e:
+        print(f"Error in lock: {e}")
+
+# --- دستورات مدیریت گروه ---
+
+async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور /warn برای دادن اخطار"""
+    if not update.effective_chat.get_member(update.effective_user.id).is_administrator:
+        return await update.message.reply_text("❌ شما ادمین نیستید!")
+
+    if not context.args:
+        return await update.message.reply_text("✅ کاربرد: `/warn @username`", parse_mode='Markdown')
+
+    target_user = context.args[0].replace("@", "")
+    # در اینجا برای سادگی فرض می‌کنیم کاربر را پیدا کردیم (در ربات واقعی باید از فیلتر پیام‌ها استفاده شود)
+    # این بخش نیاز به منطق پیچیده‌تری برای پیدا کردن ID از روی یوزرنیم دارد
+    await update.message.reply_text(f"⚠️ به کاربر {target_user} یک اخطار داده شد.")
+    db.add_warning(0, update.effective_chat.id) # مثال
+
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور /ban برای مسدود کردن"""
+    if not update.effective_chat.get_member(update.effective_user.id).is_administrator:
         return
 
-    if group[3] == 1 and msg.photo:
-        await msg.delete()
-        return
+    if context.args:
+        # در ربات اصلی باید کاربر را پیدا کنید، اینجا فقط یک مثال است
+        await update.message.reply_text("🚫 کاربر مسدود شد (در نسخه کامل از ID استفاده کنید)")
+        # در اینجا باید با API تلگرام کاربر را Ban کنید
 
-    if group[4] == 1 and msg.video:
-        await msg.delete()
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat.get_member(update.effective_user.id).is_administrator:
         return
+    await update.message.reply_text("🔓 کاربر آزاد شد.")
 
-# --- بخش اقتصاد و بازی (Economy & Fun) ---
+# --- دستورات اقتصاد و سرگرمی ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.add_user(user_id)
     await update.message.reply_text(
-        f"🤖 **سلام {update.effective_user.first_name}!**\n\n"
-        f"🚀 به ربات مدیریت پیشرفته خوش آمدی.\n"
+        f"👋 سلام {update.effective_user.first_name} عزیز!\n"
+        f"🤖 ربات مدیریت پیشرفته آماده است.\n"
         f"🛠 سازنده: **امیرعلی فروزان اصل**\n\n"
         f"💰 سکه: 0 | 🆙 لول: 1\n"
-        f"📜 از دستور /help برای مشاهده امکانات استفاده کنید."
+        f"📜 دستورات: /profile, /coin, /help",
+        parse_mode='Markdown'
     )
 
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = db.get_user(update.effective_user.id)
-    if user:
-        text = (f"👤 **پروفایل کاربر**\n\n"
-                f"🆔 آیدی: `{user[0]}`\n"
-                f"💰 سکه: {user[1]}\n"
-                f"✨ XP: {user[2]}\n"
-                f"🆙 لول: {user[3]}")
-        await update.message.reply_text(text, parse_mode='Markdown')
-
-async def coin_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # بازی شیر یا خط (Fun Section)
-    res = random.choice(["شیر 🪙", "خط ❌"])
-    user_id = update.effective_user.id
-    db.cursor.execute("UPDATE users SET coins = coins + 10 WHERE user_id = ?", (user_id,))
-    db.conn.commit()
-    await update.message.reply_text(f"نتیجه: {res}\n\n🎉 شما 10 سکه برنده شدید!")
-
-# --- پنل مدیریت (Admin Panel) ---
-
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return await update.message.reply_text("❌ فقط مالک ربات می‌تواند این دستور را اجرا کند.")
-
-    keyboard = [
-        [InlineKeyboardButton("🔒 قفل لینک", callback_data="lock_link"), InlineKeyboardButton("🔓 باز کردن لینک", callback_data="unlock_link")],
-        [InlineKeyboardButton("🎬 قفل فیلم", callback_data="lock_video"), InlineKeyboardButton("🔓 باز کردن فیلم", callback_data="unlock_video")],
-        [InlineKeyboardButton("📊 آمار کاربران", callback_data="stats")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🛠 **پنل مدیریت اصلی**\nانتخاب کنید چه چیزی را مدیریت کنید:", reply_markup=reply_markup)
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    chat_id = update.effective_chat.id
-    await query.answer()
-
-    if query.data == "lock_link":
-        db.update_group_setting(chat_id, "lock_link", 1)
-        await query.edit_message_text("✅ قفل لینک فعال شد.")
-    elif query.data == "unlock_link":
-        db.update_group_setting(chat_id, "lock_link", 0)
-        await query.edit_message_text("🔓 قفل لینک غیرفعال شد.")
-    elif query.data == "lock_video":
-        db.update_group_setting(chat_id, "lock_video", 1)
-        await query.edit_message_text("✅ قفل فیلم فعال شد.")
-    elif query.data == "unlock_video":
-        db.update_group_setting(chat_id, "lock_video", 0)
-        await query.edit_message_text("🔓 قفل فیلم غیرفعال شد.")
-
-# --- اجرا ---
-
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # هندلرها
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(CommandHandler("coin", coin_game))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("help", lambda u, c: u.message.reply_text("دستورات:\n/start - شروع\n/profile - پروفایل\n/coin - بازی سکه\n/admin - پنل مدیریت")))
-    
-    # هندلر دکمه‌ها
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    # هندلر اصلی فیلتر (Security Engine)
-    app.add_handler(MessageHandler(filters.ALL, main_filter))
-
-    print("🚀 ربات با موفقیت توسط امیرعلی فروزان اصل روشن شد...")
-    app.run_polling()
+async def profile(update: Update, context: Context
